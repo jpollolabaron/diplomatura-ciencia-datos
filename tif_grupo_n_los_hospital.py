@@ -7,17 +7,26 @@ Original file is located at
     https://colab.research.google.com/drive/1QdabYOxfPiVjtEfviT25kf2G3hGUBtNF
 """
 
-import sys, platform, subprocess, json, os, math, random, re, warnings
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+# ============================================================
+# IMPORTACIÓN DE LIBRERÍAS
+# ============================================================
 
-from importlib.metadata import version, PackageNotFoundError
-
-from google.colab import drive
+# IMPORTS GENERALES
+import sys, json, os, math, random, re, warnings
 from pathlib import Path
 
-from sklearn.model_selection import GroupKFold, StratifiedKFold, GridSearchCV, RandomizedSearchCV
+# CIENCIA DE DATOS / NUMPY / PANDAS
+import numpy as np
+import pandas as pd
+
+# VISUALIZACIÓN
+import matplotlib.pyplot as plt
+
+# ENTORNO COLAB (si se usa Drive para datos)
+from google.colab import drive
+
+# SCIKIT-LEARN: MODELADO Y PREPROCESAMIENTO
+from sklearn.model_selection import GroupKFold, GridSearchCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score, average_precision_score, precision_recall_curve, roc_curve
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
@@ -25,34 +34,57 @@ from sklearn.pipeline import Pipeline
 from sklearn.linear_model import ElasticNet, LogisticRegression
 from sklearn.impute import SimpleImputer
 
+# GRADIENT BOOSTING: XGBoost y LightGBM
 from xgboost import XGBRegressor, XGBClassifier
 from lightgbm import LGBMRegressor, LGBMClassifier
 
+# ============================================================
+# CONFIGURACIÓN INICIAL DEL ENTORNO Y PARÁMETROS DEL MODELO
+# ============================================================
+
+# Ignorar advertencias para no ensuciar la salida en Colab
 warnings.filterwarnings("ignore")
 
-# Semillas globales
+# Semilla para reproducibilidad
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 random.seed(RANDOM_STATE)
 
-PERCENTIL_LONG_STAY = 0.80
+# Parámetros específicos del problema
+PERCENTIL_LONG_STAY = 0.80  # percentil para definir "long_stay"
 
+# Nombres de columnas relevantes en el dataset
 GROUP_COL = "mrd_no"
 DATE_ADM = "d_o_a"
 DATE_DIS = "d_o_d"
 TARGET_REG = "LOS_days"
 TARGET_BIN = "long_stay"
 
+# Montaje de Google Drive y carga del dataset
 drive.mount('/content/drive')
 DATASET_CSV = "/content/drive/MyDrive/HDHI Admission data.csv"
 df = pd.read_csv(DATASET_CSV)
 
+# Inspección inicial del dataset
 print(df.shape)
 df.head()
 
-# 3) Funciones auxiliares
+# ============================================================
+# FUNCIONES AUXILIARES
+# ============================================================
+
 def normalizar_cols(cols):
-    """Normaliza nombres de columnas a snake_case"""
+    """
+    Normaliza nombres de columnas a formato snake_case:
+    - Elimina espacios iniciales/finales.
+    - Elimina caracteres invisibles (ej. \u200b).
+    - Sustituye caracteres no alfanuméricos por "_".
+    - Colapsa múltiples "_" en uno solo.
+    - Pasa todo a minúsculas.
+    Ejemplo:
+        "D.O.A (Fecha Admisión)" -> "d_o_a_fecha_admision"
+    """
+
     out = []
     for c in cols:
         c = c.strip()
@@ -63,181 +95,204 @@ def normalizar_cols(cols):
     return out
 
 def parsear_fechas(df, col, dayfirst=True):
+    """
+    Convierte la columna indicada de un DataFrame a tipo datetime.
+    - Si la columna existe, intenta parsear las fechas.
+    - Los errores se convierten a NaT (valor nulo de fechas).
+    - dayfirst=True asume formato europeo/latino (DD/MM/YYYY).
+    """
+
     if col in df.columns:
         df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=dayfirst)
     return df
 
-# Normalizar columnas
+# ============================================================
+# PREPROCESAMIENTO INICIAL DEL DATASET
+# ============================================================
+
+# 1) Normalización de nombres de columnas
 df.columns = normalizar_cols(df.columns)
 
-# Parseo de fechas (hay formatos mixtos en el dataset)
+# 2) Parseo de fechas de admisión y alta
 parsear_fechas(df, "d_o_a", dayfirst=True)
 parsear_fechas(df, "d_o_d", dayfirst=True)
 
+# 3) Inspección del dataset tras normalización
 print(df.head())
-
 print("Nulos por columna:")
 print(df.isna().mean().sort_values(ascending=False))
 
-# Filtrar fechas inválidas (discharge < admission)
+# 4) Eliminar casos en que la fecha de alta < fecha de ingreso
 mask_bad = df[DATE_DIS] < df[DATE_ADM]
 print("Registros con alta < ingreso:", mask_bad.sum())
 df = df[~mask_bad].copy()
 
-'''
-quizas remover porque al imputar antes del split, hay fuga
-# Tratamiento simple de nulos en numéricas (mediana) + bandera de ausencia
-num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-num_cols = [c for c in num_cols if c not in []]  # excluir targets por ahora si existieran
-for c in num_cols:
-    print(c)
-    if df[c].isna().any():
-        df[c + "_isna"] = df[c].isna().astype(int)
-        df[c] = df[c].fillna(df[c].median())
-'''
+print("Dataset limpio:", df.shape)
 
-print("Post-imputación, nulos:")
-print(df.isna().mean().sort_values(ascending=False))
+# ============================================================
+# DEFINICIÓN DEL TARGET Y SPLIT TRAIN/TEST (SIN FUGA)
+# ============================================================
 
-# ------------------------------------------------------------------
-# Crear TARGET_REG (LOS_days) ANTES de split y filtrar nulos de LOS
-# ------------------------------------------------------------------
+# 1) Calcular longitud de estadía (LOS_days) como diferencia en días
 df[TARGET_REG] = (df[DATE_DIS] - df[DATE_ADM]).dt.days.astype(float)
+
+# Se eliminan registros donde no se pudo calcular LOS (NaT en fechas)
 df = df.dropna(subset=[TARGET_REG]).copy()
 
-# Separa train/test sin fuga por paciente
+# 2) Preparar columna de agrupación (paciente)
+# Se fuerza a string y se completan nulos con un ID ficticio.
 if df[GROUP_COL].isna().any():
     df[GROUP_COL] = df[GROUP_COL].astype("string").fillna("missing_id")
 
+# 3) Split train/test con GroupKFold
 train_idx, test_idx = next(GroupKFold(n_splits=5).split(df, groups=df[GROUP_COL]))
 
 df_train = df.iloc[train_idx].copy()
 df_test  = df.iloc[test_idx].copy()
 
+# 4) Inspección de tamaños de los conjuntos
 print("Train:", df_train.shape, " Test:", df_test.shape)
 
-print("Train después del filtrado:", df_train.shape)
-print("Test después del filtrado:", df_test.shape)
+# 5) Verificación extra: pacientes únicos en cada set
+train_ids = set(df_train[GROUP_COL].unique())
+test_ids  = set(df_test[GROUP_COL].unique())
+intersect = train_ids & test_ids
 
-def subgroup_key(r):
-  # Subgrupo simeple: tipo_admisión × bin_edad × ckd (Tolera NaN en age/admission_type/ckd)
-  # Campo de admisión tras normalizar: "type_of_admission_er_opd"
-  adm = r.get("type_of_admission_er_opd", r.get("admission_type", "UNK"))
-  adm = "UNK" if pd.isna(adm) else str(adm)
+print("Pacientes únicos en Train:", len(train_ids))
+print("Pacientes únicos en Test :", len(test_ids))
+print("Pacientes presentes en ambos sets:", len(intersect))
 
-  # age -> bin
-  age = r.get("age", np.nan)
-  if pd.isna(age):
-      age_label = "NA"
-  else:
-      age_label = pd.cut([age],
-                          bins=[0, 40, 60, 80, 120],
-                          labels=["<=40", "41-60", "61-80", ">80"])[0]
-      age_label = "NA" if pd.isna(age_label) else str(age_label)
-
-  # ckd binario robusto
-  raw_ckd = r.get("ckd", 0)
-  ckd_flag = 0 if pd.isna(raw_ckd) else int(raw_ckd)
-
-  return (adm, age_label, ckd_flag)
-
+# ============================================================
+# BASELINES: MÉTRICAS INICIALES PARA REGRESIÓN Y CLASIFICACIÓN
+# ============================================================
+# Funciones auxiliares y baselines para comparar con los modelos avanzados
 
 def recall_at_topk(y_true, y_score, k):
+    """
+    Calcula el recall en el top-k:
+    - Ordena instancias por score descendente.
+    - Toma las k con mayor score.
+    - Mide qué proporción de verdaderos positivos
+      quedaron dentro de esas k.
+    """
     y_true = np.asarray(y_true)
     y_score = np.asarray(y_score)
     k = int(k)
     if k <= 0:
         return 0.0
-    # índices ordenados por score descendente
-    top_idx = np.argsort(-y_score)[:k]
-    tp_in_topk = y_true[top_idx].sum()
+
+    top_idx = np.argsort(-y_score)[:k]  # índices ordenados
+    tp_in_topk = y_true[top_idx].sum()  # verdaderos positivos en top-k
     total_pos = y_true.sum()
     return float(tp_in_topk / total_pos) if total_pos > 0 else 0.0
 
+def generar_claves(df):
+    """
+    Genera una clave de subgrupo para cada fila combinando:
+    - tipo de admisión (ER/OPD u otra),
+    - rango etario en bins,
+    - flag de CKD.
+    Devuelve una Series de tuplas (adm, edad_bin, ckd).
+    """
+    # admisión
+    adm = df.get("type_of_admission_emergency_opd") # columna de tipo de admisión
+    adm = adm.fillna("UNK").astype(str)             # valores nulos => "UNK"
+
+    # edad en bins
+    age_bins = pd.cut(df["age"], bins=[0, 40, 60, 80, 120],
+                      labels=["<=40", "41-60", "61-80", ">80"])
+    age_labels = age_bins.astype(str).fillna("NA")   # NaN => "NA"
+
+    # ckd
+    ckd_flag = df["ckd"].fillna(0).astype(int)      # flag binario CKD
+
+    return pd.Series(list(zip(adm, age_labels, ckd_flag)), index=df.index)
+
+# ------------------------------------------------------------
+# Baseline de regresión
+# ------------------------------------------------------------
 def baseline_regresion(train, test):
     """
-    Baseline de regresión sin fuga:
-    - Predice la mediana histórica de LOS por subgrupo (calculada SOLO en train).
+    Baseline de regresión:
+    - Predice la mediana de LOS por subgrupo (solo con train).
+    - Si un subgrupo no existe en test, usa la mediana global.
     """
-    keys_train = train.apply(subgroup_key, axis=1)
-    grp_median = (
-        pd.DataFrame({"key": keys_train, "los": train[TARGET_REG]})
-        .groupby("key")["los"].median()
-    )
+    # Generar claves en bloque
+    keys_train = generar_claves(train)
+    keys_test  = generar_claves(test)
 
+    # Mediana por subgrupo
+    grp_median = train.groupby(keys_train)[TARGET_REG].median()
     global_median = float(train[TARGET_REG].median())
 
-    def predict_row(r):
-        k = subgroup_key(r)
-        return float(grp_median.get(k, global_median))
+    # Predicciones en test usando map
+    y_pred = keys_test.map(grp_median).fillna(global_median)
 
-    y_pred = test.apply(predict_row, axis=1)
+    # Métricas
     mae = mean_absolute_error(test[TARGET_REG], y_pred)
     mse = mean_squared_error(test[TARGET_REG], y_pred)
     rmse = float(np.sqrt(mse))
+
     return {"mae": float(mae), "rmse": rmse}, y_pred
+
+# ------------------------------------------------------------
+# Baseline de clasificación
+# ------------------------------------------------------------
 
 def baseline_clasificacion(train, test):
     """
-    Baseline de clasificación SIN fuga:
-    - 1) Define long_stay en TRAIN con un umbral por subgrupo (percentil).
-    - 2) Calcula probabilidad histórica de long_stay por subgrupo en TRAIN.
-    - 3) Predice en TEST esa probabilidad (score continuo) por subgrupo.
-    Métricas AUC/AP se calculan con scores continuos.
+    Baseline de clasificación:
+    1) Define "long_stay" en TRAIN según percentil (por subgrupo).
+    2) Calcula probabilidad histórica de long_stay por subgrupo (train).
+    3) Predice esa probabilidad en TEST.
+    - Métricas: AUC, AP, Recall@Top20%.
     """
-    # Umbral (percentil) por subgrupo para etiquetar en TRAIN
-    keys_train = train.apply(subgroup_key, axis=1)
-    thr_by_key = (
-        pd.DataFrame({"key": keys_train, "los": train[TARGET_REG]})
-        .groupby("key")["los"].quantile(PERCENTIL_LONG_STAY)
-    )
+
+    # Generar claves
+    keys_train = generar_claves(train)
+    keys_test  = generar_claves(test)
+
+    # Umbral por subgrupo (percentil)
+    thr_by_key = train.groupby(keys_train)[TARGET_REG].quantile(PERCENTIL_LONG_STAY)
     global_thr = float(train[TARGET_REG].quantile(PERCENTIL_LONG_STAY))
 
-    # Etiqueta binaria en TRAIN (sin tocar TEST)
+    # Etiquetas en train
+    thr_series = keys_train.map(thr_by_key).fillna(global_thr)
     train = train.copy()
-    def label_row_train(r):
-        k = subgroup_key(r)
-        thr = float(thr_by_key.get(k, global_thr))
-        return int(r[TARGET_REG] > thr)
-    train[TARGET_BIN] = train.apply(label_row_train, axis=1)
+    train[TARGET_BIN] = (train[TARGET_REG] > thr_series).astype(int)
 
-    # Probabilidad histórica por subgrupo
-    keys_train = train.apply(subgroup_key, axis=1)
-    p_by_key = (
-        pd.DataFrame({"key": keys_train, "y": train[TARGET_BIN]})
-        .groupby("key")["y"].mean()
-    )
+    # Probabilidades históricas
+    p_by_key = train.groupby(keys_train)[TARGET_BIN].mean()
     global_p = float(train[TARGET_BIN].mean())
 
-    # Score continuo para TEST
-    def score_row_test(r):
-        k = subgroup_key(r)
-        return float(p_by_key.get(k, global_p))
-    y_score = test.apply(score_row_test, axis=1)
+    # Scores en test
+    y_score = keys_test.map(p_by_key).fillna(global_p)
 
     # Métricas
     ap = float(average_precision_score(test[TARGET_BIN], y_score))
     roc = float(roc_auc_score(test[TARGET_BIN], y_score))
     k20 = max(1, int(0.2 * len(test)))
     rec_at_20 = float(recall_at_topk(test[TARGET_BIN], y_score, k=k20))
+
     return {"ap": ap, "roc_auc": roc, "recall_at_20": rec_at_20}, y_score
 
-def _label_with_train_thresholds(r):
-    k = subgroup_key(r)
-    thr = float(thr_by_key.get(k, global_thr))
-    return int(r[TARGET_REG] > thr)
+# ------------------------------------------------------------
+# Definición del TARGET_BIN según thresholds aprendidos en TRAIN
+# ------------------------------------------------------------
+keys_train = generar_claves(df_train)
+keys_test  = generar_claves(df_test)
 
-# Definir TARGET_BIN consistente con el baseline: umbral por SUBGRUPO aprendido en TRAIN
-p_long = PERCENTIL_LONG_STAY
-keys_train_for_thr = df_train.apply(subgroup_key, axis=1)
-thr_by_key = (
-    pd.DataFrame({"key": keys_train_for_thr, "los": df_train[TARGET_REG]})
-      .groupby("key")["los"].quantile(p_long)
-)
-global_thr = float(df_train[TARGET_REG].quantile(p_long))
+# Umbral por subgrupo (percentil definido en train)
+thr_by_key = df_train.groupby(keys_train)[TARGET_REG].quantile(PERCENTIL_LONG_STAY)
+global_thr = float(df_train[TARGET_REG].quantile(PERCENTIL_LONG_STAY))
 
-df_train[TARGET_BIN] = df_train.apply(_label_with_train_thresholds, axis=1)
-df_test[TARGET_BIN]  = df_test.apply(_label_with_train_thresholds, axis=1)
+# Etiquetas binarias en train/test
+df_train[TARGET_BIN] = (df_train[TARGET_REG] > keys_train.map(thr_by_key).fillna(global_thr)).astype(int)
+df_test[TARGET_BIN]  = (df_test[TARGET_REG]  > keys_test.map(thr_by_key).fillna(global_thr)).astype(int)
+
+# ------------------------------------------------------------
+# Inspecciones rápidas y métricas baseline
+# ------------------------------------------------------------
 
 print("Post-imputación, nulos:")
 print(df.isna().mean().sort_values(ascending=False))
@@ -245,7 +300,7 @@ print(df.isna().mean().sort_values(ascending=False))
 print("Estadísticos LOS:")
 print(df[TARGET_REG].describe())
 
-print("Umbral long-stay (percentil global en TRAIN):", p_long, "→", global_thr)
+print("Umbral long-stay (percentil global en TRAIN):", PERCENTIL_LONG_STAY, "→", global_thr)
 print("Prevalencia long_stay - train/test:", df_train[TARGET_BIN].mean(), "/", df_test[TARGET_BIN].mean())
 
 base_reg_metrics, _ = baseline_regresion(df_train, df_test)
@@ -254,12 +309,55 @@ base_cls_metrics, _ = baseline_clasificacion(df_train, df_test)
 print("Baseline (Reg):", base_reg_metrics)
 print("Baseline (Cls):", base_cls_metrics)
 
-# Selección simple de columnas
+
+# ------------------------------------------------------------
+# Gráfico comparativo de métricas baseline
+# ------------------------------------------------------------
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+# --- Baseline de Regresión ---
+reg_metrics = base_reg_metrics
+axes[0].bar(reg_metrics.keys(), reg_metrics.values(), color=["skyblue", "salmon"])
+axes[0].set_title("Baseline Regresión")
+axes[0].set_ylabel("Error")
+for i, (k, v) in enumerate(reg_metrics.items()):
+    axes[0].text(i, v, f"{v:.2f}", ha="center", va="bottom")
+
+# --- Baseline de Clasificación ---
+cls_metrics = base_cls_metrics
+axes[1].bar(cls_metrics.keys(), cls_metrics.values(), color=["lightgreen", "orange", "violet"])
+axes[1].set_title("Baseline Clasificación")
+axes[1].set_ylabel("Score")
+for i, (k, v) in enumerate(cls_metrics.items()):
+    axes[1].text(i, v, f"{v:.2f}", ha="center", va="bottom")
+
+plt.suptitle("Métricas Baseline", fontsize=14, fontweight="bold")
+plt.show()
+
+# ============================================================
+# PIPELINE DE PREPROCESAMIENTO
+# ============================================================
+# Se definen las transformaciones a aplicar a variables numéricas
+# y categóricas antes del modelado.
+# Incluye imputación de nulos, escalado y codificación one-hot.
+
+# ------------------------------------------------------------
+# 1) Selección de columnas por tipo
+#    - numéricas: todas las que sean número, excepto targets y grupo
+#    - categóricas: object/string, excepto targets y grupo
+# ------------------------------------------------------------
+
 num_features = [c for c in df.select_dtypes(include=[np.number]).columns
                 if c not in [TARGET_REG, TARGET_BIN, GROUP_COL]]
 
 cat_features = [c for c in df.select_dtypes(include=["object", "string"]).columns
                 if c not in [TARGET_REG, TARGET_BIN, GROUP_COL]]
+
+# ------------------------------------------------------------
+# 2) Definición de transformadores
+#    - Numéricas: imputación por mediana + escalado estándar
+#    - Categóricas: imputación por moda + one-hot encoding
+# ------------------------------------------------------------
 
 numeric_transformer = Pipeline(steps=[
     ("imputer", SimpleImputer(strategy="median")),
@@ -271,6 +369,11 @@ categorical_transformer = Pipeline(steps=[
     ("onehot", OneHotEncoder(handle_unknown="ignore"))
 ])
 
+# ------------------------------------------------------------
+# 3) ColumnTransformer
+#    Une ambos pipelines en un solo preprocesador.
+# ------------------------------------------------------------
+
 preprocess = ColumnTransformer(
     transformers=[
         ("num", numeric_transformer, num_features),
@@ -278,12 +381,26 @@ preprocess = ColumnTransformer(
     ]
 )
 
+
+# ------------------------------------------------------------
+# 4) Inspección: lista de features seleccionadas
+# ------------------------------------------------------------
+
 print("Num features:", num_features)
 print("Cat features:", cat_features)
 
-#Modelado: Regresión (LOS)
+# ============================================================
+# MODELADO: REGRESIÓN (LOS en días)
+# ============================================================
+# Se prueban distintos algoritmos de regresión con el pipeline
+# de preprocesamiento definido previamente.
+# - ElasticNet con búsqueda de hiperparámetros
+# - XGBoost Regressor
+# - LightGBM Regressor
 
-from sklearn.model_selection import GroupKFold, GridSearchCV
+# ------------------------------------------------------------
+# 1) Separación de features (X) y target (y)
+# ------------------------------------------------------------
 
 X_train = df_train.drop([TARGET_REG, TARGET_BIN], axis=1)
 y_train_reg = df_train[TARGET_REG]
@@ -291,25 +408,27 @@ X_test  = df_test.drop([TARGET_REG, TARGET_BIN], axis=1)
 y_test_reg = df_test[TARGET_REG]
 groups = df_train[GROUP_COL]
 
-# Elastic Net
+# ------------------------------------------------------------
+# 2) ElasticNet con GridSearchCV
+# ------------------------------------------------------------
+
 enet = Pipeline(steps=[
     ("preprocess", preprocess),
     ("model", ElasticNet(random_state=RANDOM_STATE, max_iter=10000))
 ])
 
-
+# Hiperparámetros: versión reducida para acelerar entrenamiento
 param_enet = {
-    "model__alpha": [0.1, 1.0],
-    "model__l1_ratio": [0.5]
+    "model__alpha": [0.1, 1.0],   # fuerza de regularización
+    "model__l1_ratio": [0.5]      # mezcla L1/L2
 }
 
 '''
-#este tarda mas
+# Versión más compleja (más lenta):
 param_enet = {
     "model__alpha": [0.01, 0.1, 1.0],
     "model__l1_ratio": [0.1, 0.5, 0.9]
 }
-
 '''
 
 cv = GroupKFold(n_splits=5)
@@ -317,45 +436,116 @@ gs_enet = GridSearchCV(enet, param_enet, scoring="neg_mean_absolute_error",
                        cv=cv.split(X_train, y_train_reg, groups=groups), n_jobs=-1)
 gs_enet.fit(X_train, y_train_reg)
 
+# ------------------------------------------------------------
+# 3) Función de evaluación (para reusar en todos los modelos)
+# ------------------------------------------------------------
+
 def eval_regressor(pipeline, X_te, y_te):
+    # Evalúa un regresor y devuelve métricas MAE y RMSE
     pred = pipeline.predict(X_te)
     mae = mean_absolute_error(y_te, pred)
     mse = mean_squared_error(y_te, pred)
-    rmse = np.sqrt(mse)          # raíz cuadrada del MSE
+    rmse = np.sqrt(mse)
     return {"mae": float(mae), "rmse": float(rmse)}, pred
 
 enet_metrics, enet_pred = eval_regressor(gs_enet.best_estimator_, X_test, y_test_reg)
 print("ElasticNet (test):", enet_metrics)
 
-# XGB/LGBM opcional (si están instalados)
+
+# ------------------------------------------------------------
+# 4) XGBoost Regressor
+# ------------------------------------------------------------
+
 gbm_results = {}
 
 xgb_reg = Pipeline(steps=[
     ("preprocess", preprocess),
     ("model", XGBRegressor(
-        random_state=RANDOM_STATE, n_estimators=100, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8, max_depth=4, reg_lambda=1.0
+        random_state=RANDOM_STATE,
+        n_estimators=100,       # nº de árboles
+        learning_rate=0.05,     # tasa de aprendizaje
+        subsample=0.8,          # proporción de muestras por árbol
+        colsample_bytree=0.8,   # proporción de features por árbol
+        max_depth=4,            # profundidad máxima
+        reg_lambda=1.0          # regularización L2
     ))
 ])
 xgb_reg.fit(X_train, y_train_reg)
 gbm_results["xgb"], xgb_pred = eval_regressor(xgb_reg, X_test, y_test_reg)
 print("XGBRegressor (test):", gbm_results["xgb"])
 
+# ------------------------------------------------------------
+# 5) LightGBM Regressor
+# ------------------------------------------------------------
+
 lgb_reg = Pipeline(steps=[
     ("preprocess", preprocess),
     ("model", LGBMRegressor(
-        random_state=RANDOM_STATE, n_estimators=150, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8, max_depth=-1, reg_lambda=0.0
+        random_state=RANDOM_STATE,
+        n_estimators=150,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        max_depth=-1,
+        reg_lambda=0.0
     ))
 ])
 lgb_reg.fit(X_train, y_train_reg)
 gbm_results["lgbm"], lgbm_pred = eval_regressor(lgb_reg, X_test, y_test_reg)
 print("LGBMRegressor (test):", gbm_results["lgbm"])
 
-# Modelado: Clasificación (Long-stay)
+
+# ------------------------------------------------------------
+# Gráfico comparativo de modelos de regresión (con baseline)
+# ------------------------------------------------------------
+all_metrics = {
+    "Baseline": base_reg_metrics,
+    "ElasticNet": enet_metrics,
+    "XGBRegressor": gbm_results["xgb"],
+    "LGBMRegressor": gbm_results["lgbm"]
+}
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# --- Panel 1: MAE ---
+mae_values = [m["mae"] for m in all_metrics.values()]
+axes[0].bar(all_metrics.keys(), mae_values, color=["gray", "skyblue", "orange", "green"])
+axes[0].set_title("Comparación MAE (Error Absoluto Medio)")
+axes[0].set_ylabel("Días")
+axes[0].grid(axis="y", linestyle="--", alpha=0.7)
+for i, v in enumerate(mae_values):
+    axes[0].text(i, v, f"{v:.2f}", ha="center", va="bottom")
+
+# --- Panel 2: RMSE ---
+rmse_values = [m["rmse"] for m in all_metrics.values()]
+axes[1].bar(all_metrics.keys(), rmse_values, color=["gray", "skyblue", "orange", "green"])
+axes[1].set_title("Comparación RMSE (Raíz Error Cuadrático Medio)")
+axes[1].set_ylabel("Días")
+axes[1].grid(axis="y", linestyle="--", alpha=0.7)
+for i, v in enumerate(rmse_values):
+    axes[1].text(i, v, f"{v:.2f}", ha="center", va="bottom")
+
+plt.suptitle("Métricas de Modelos de Regresión (con Baseline)", fontsize=14, fontweight="bold")
+plt.show()
+
+# ============================================================
+# MODELADO: CLASIFICACIÓN (Predicción de long-stay)
+# ============================================================
+# Se prueban distintos algoritmos de clasificación:
+# - Regresión logística (con GridSearchCV)
+# - XGBoost Classifier
+# ============================================================
+
+# ------------------------------------------------------------
+# 1) Definición de target binario
+# ------------------------------------------------------------
 
 y_train_bin = df_train[TARGET_BIN]
 y_test_bin = df_test[TARGET_BIN]
+
+# ------------------------------------------------------------
+# 2) Logistic Regression con GridSearchCV
+# ------------------------------------------------------------
 
 logreg = Pipeline(steps=[
     ("preprocess", preprocess),
@@ -385,7 +575,9 @@ def eval_classifier(pipeline, X_te, y_te):
 lr_metrics, lr_proba = eval_classifier(gs_lr.best_estimator_, X_test, y_test_bin)
 print("Logistic Regression (test):", lr_metrics)
 
-xgb_cls_metrics = None
+# ------------------------------------------------------------
+# 3) XGBoost Classifier
+# ------------------------------------------------------------
 
 xgb_cls = Pipeline(steps=[
     ("preprocess", preprocess),
@@ -399,50 +591,119 @@ xgb_cls.fit(X_train, y_train_bin)
 xgb_cls_metrics, xgb_proba = eval_classifier(xgb_cls, X_test, y_test_bin)
 print("XGBClassifier (test):", xgb_cls_metrics)
 
-#Selección de modelo y gráficas (PR/ROC, comparación vs baseline)
 
+
+# ------------------------------------------------------------
+# 4) Gráfico comparativo de modelos de clasificación
+# ------------------------------------------------------------
+# ============================================================
+# COMPARACIÓN: Baseline vs Modelos de Clasificación
+# ============================================================
+
+# Métricas del baseline (ya calculadas antes)
+base_cls_metrics, _ = baseline_clasificacion(df_train, df_test)
+
+# Consolidar todas las métricas
+all_cls_metrics = {
+    "Baseline": base_cls_metrics,
+    "Logistic Regression": lr_metrics,
+    "XGBClassifier": xgb_cls_metrics
+}
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+# --- Panel 1: Average Precision ---
+ap_values = [m["ap"] for m in all_cls_metrics.values()]
+axes[0].bar(all_cls_metrics.keys(), ap_values, color=["gray", "skyblue", "orange"])
+axes[0].set_title("Comparación AP (Precisión Promedio)")
+for i, v in enumerate(ap_values):
+    axes[0].text(i, v, f"{v:.2f}", ha="center", va="bottom")
+
+# --- Panel 2: ROC-AUC ---
+roc_values = [m["roc_auc"] for m in all_cls_metrics.values()]
+axes[1].bar(all_cls_metrics.keys(), roc_values, color=["gray", "skyblue", "orange"])
+axes[1].set_title("Comparación ROC-AUC (Área bajo la curva ROC)")
+for i, v in enumerate(roc_values):
+    axes[1].text(i, v, f"{v:.2f}", ha="center", va="bottom")
+
+# --- Panel 3: Recall@20% ---
+rec_values = [m["recall_at_20"] for m in all_cls_metrics.values()]
+axes[2].bar(all_cls_metrics.keys(), rec_values, color=["gray", "skyblue", "orange"])
+axes[2].set_title("Comparación Recall@20% (Sensibilidad en Top 20%)")
+for i, v in enumerate(rec_values):
+    axes[2].text(i, v, f"{v:.2f}", ha="center", va="bottom")
+
+plt.suptitle("Métricas de Modelos de Clasificación (Long-stay, con Baseline)",
+             fontsize=14, fontweight="bold")
+plt.show()
+
+# ============================================================
+# SELECCIÓN DE MODELO Y GRÁFICAS (Clasificación Long-stay)
+# ============================================================
+
+# Función para curva Precision-Recall
 def plot_pr(y_true, scores, title):
     precision, recall, _ = precision_recall_curve(y_true, scores)
     plt.figure()
-    plt.step(recall, precision, where='post')
-    plt.xlabel("Recall")
+    plt.step(recall, precision, where='post', color="blue")
+    plt.xlabel("Recall (Sensibilidad)")
     plt.ylabel("Precision")
     plt.title(title)
     plt.grid(True)
     plt.show()
 
+# Función para curva ROC
 def plot_roc(y_true, scores, title):
     fpr, tpr, _ = roc_curve(y_true, scores)
     plt.figure()
-    plt.plot(fpr, tpr)
-    plt.plot([0,1],[0,1], linestyle="--")
-    plt.xlabel("FPR")
-    plt.ylabel("TPR")
+    plt.plot(fpr, tpr, label="Modelo")
+    plt.plot([0,1], [0,1], linestyle="--", color="gray", label="Aleatorio")
+    plt.xlabel("Tasa de Falsos Positivos (FPR)")
+    plt.ylabel("Tasa de Verdaderos Positivos (TPR)")
     plt.title(title)
+    plt.legend()
     plt.grid(True)
     plt.show()
 
-# PR/ROC para el mejor clasificador disponible (LogReg por defecto)
-plot_pr(y_test_bin, lr_proba, "Precision-Recall — Logistic Regression")
-plot_roc(y_test_bin, lr_proba, "ROC — Logistic Regression")
-
-# Tabla comparativa simple
-comp = {
-    "baseline_reg": base_reg_metrics,
-    "enet_reg": enet_metrics
+# ------------------------------------------------------------
+# 1) Selección automática del mejor clasificador
+# ------------------------------------------------------------
+all_cls_metrics = {
+    "Logistic Regression": lr_metrics,
+    "XGBClassifier": xgb_cls_metrics
 }
-if 'gbm_results' in globals():
-    for k,v in gbm_results.items():
-        comp[f"{k}_reg"] = v
+all_cls_probas = {
+    "Logistic Regression": lr_proba,
+    "XGBClassifier": xgb_proba
+}
+
+best_model_name = max(all_cls_metrics, key=lambda m: all_cls_metrics[m]["ap"])
+best_proba = all_cls_probas[best_model_name]
+
+print(f"Mejor clasificador según AP: {best_model_name} → AP={all_cls_metrics[best_model_name]['ap']:.3f}")
+
+# Curvas para el mejor clasificador
+plot_pr(y_test_bin, best_proba, f"Curva Precision-Recall — {best_model_name} (Long-stay)")
+plot_roc(y_test_bin, best_proba, f"Curva ROC — {best_model_name} (Long-stay)")
+
+# ------------------------------------------------------------
+# 2) Tablas comparativas (Regresión y Clasificación)
+# ------------------------------------------------------------
+comp_reg = {
+    "Baseline Reg": base_reg_metrics,
+    "ElasticNet": enet_metrics,
+    "XGBRegressor": gbm_results.get("xgb", {}),
+    "LGBMRegressor": gbm_results.get("lgbm", {})
+}
 
 comp_cls = {
-    "baseline_cls": base_cls_metrics,
-    "logreg_cls": lr_metrics
+    "Baseline Cls": base_cls_metrics,
+    "Logistic Regression": lr_metrics,
+    "XGBClassifier": xgb_cls_metrics
 }
-if 'xgb_cls_metrics' in globals() and xgb_cls_metrics is not None:
-    comp_cls["xgb_cls"] = xgb_cls_metrics
 
 print("\nComparación Regresión:")
-print(json.dumps(comp, indent=2))
+display(pd.DataFrame(comp_reg).T)
+
 print("\nComparación Clasificación:")
-print(json.dumps(comp_cls, indent=2))
+display(pd.DataFrame(comp_cls).T)
