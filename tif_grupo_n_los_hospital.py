@@ -130,7 +130,7 @@ df = df[~mask_bad].copy()
 print("Dataset limpio:", df.shape)
 
 # ============================================================
-# DEFINICIÓN DEL TARGET Y SPLIT TRAIN/TEST (SIN FUGA)
+# DEFINICIÓN DEL TARGET Y SPLIT TRAIN/TEST
 # ============================================================
 
 # 1) Calcular longitud de estadía (LOS_days) como diferencia en días
@@ -203,7 +203,7 @@ def generar_claves(df):
                       labels=["<=40", "41-60", "61-80", ">80"])
     age_labels = age_bins.astype(str).fillna("NA")   # NaN => "NA"
 
-    # ckd
+    # ckd (CHRONIC KIDNEY DISEASE)
     ckd_flag = df["ckd"].fillna(0).astype(int)      # flag binario CKD
 
     return pd.Series(list(zip(adm, age_labels, ckd_flag)), index=df.index)
@@ -294,7 +294,7 @@ df_test[TARGET_BIN]  = (df_test[TARGET_REG]  > keys_test.map(thr_by_key).fillna(
 # Inspecciones rápidas y métricas baseline
 # ------------------------------------------------------------
 
-print("Post-imputación, nulos:")
+print("Nulos por columna (antes de imputar en pipeline):")
 print(df.isna().mean().sort_values(ascending=False))
 
 print("Estadísticos LOS:")
