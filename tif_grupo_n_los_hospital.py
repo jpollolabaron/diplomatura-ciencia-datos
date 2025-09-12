@@ -280,3 +280,169 @@ preprocess = ColumnTransformer(
 
 print("Num features:", num_features)
 print("Cat features:", cat_features)
+
+#Modelado: Regresión (LOS)
+
+from sklearn.model_selection import GroupKFold, GridSearchCV
+
+X_train = df_train.drop([TARGET_REG, TARGET_BIN], axis=1)
+y_train_reg = df_train[TARGET_REG]
+X_test  = df_test.drop([TARGET_REG, TARGET_BIN], axis=1)
+y_test_reg = df_test[TARGET_REG]
+groups = df_train[GROUP_COL]
+
+# Elastic Net
+enet = Pipeline(steps=[
+    ("preprocess", preprocess),
+    ("model", ElasticNet(random_state=RANDOM_STATE, max_iter=10000))
+])
+
+
+param_enet = {
+    "model__alpha": [0.1, 1.0],
+    "model__l1_ratio": [0.5]
+}
+
+'''
+#este tarda mas
+param_enet = {
+    "model__alpha": [0.01, 0.1, 1.0],
+    "model__l1_ratio": [0.1, 0.5, 0.9]
+}
+
+'''
+
+cv = GroupKFold(n_splits=5)
+gs_enet = GridSearchCV(enet, param_enet, scoring="neg_mean_absolute_error",
+                       cv=cv.split(X_train, y_train_reg, groups=groups), n_jobs=-1)
+gs_enet.fit(X_train, y_train_reg)
+
+def eval_regressor(pipeline, X_te, y_te):
+    pred = pipeline.predict(X_te)
+    mae = mean_absolute_error(y_te, pred)
+    mse = mean_squared_error(y_te, pred)
+    rmse = np.sqrt(mse)          # raíz cuadrada del MSE
+    return {"mae": float(mae), "rmse": float(rmse)}, pred
+
+enet_metrics, enet_pred = eval_regressor(gs_enet.best_estimator_, X_test, y_test_reg)
+print("ElasticNet (test):", enet_metrics)
+
+# XGB/LGBM opcional (si están instalados)
+gbm_results = {}
+
+xgb_reg = Pipeline(steps=[
+    ("preprocess", preprocess),
+    ("model", XGBRegressor(
+        random_state=RANDOM_STATE, n_estimators=100, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8, max_depth=4, reg_lambda=1.0
+    ))
+])
+xgb_reg.fit(X_train, y_train_reg)
+gbm_results["xgb"], xgb_pred = eval_regressor(xgb_reg, X_test, y_test_reg)
+print("XGBRegressor (test):", gbm_results["xgb"])
+
+lgb_reg = Pipeline(steps=[
+    ("preprocess", preprocess),
+    ("model", LGBMRegressor(
+        random_state=RANDOM_STATE, n_estimators=150, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8, max_depth=-1, reg_lambda=0.0
+    ))
+])
+lgb_reg.fit(X_train, y_train_reg)
+gbm_results["lgbm"], lgbm_pred = eval_regressor(lgb_reg, X_test, y_test_reg)
+print("LGBMRegressor (test):", gbm_results["lgbm"])
+
+# Modelado: Clasificación (Long-stay)
+
+y_train_bin = df_train[TARGET_BIN]
+y_test_bin = df_test[TARGET_BIN]
+
+logreg = Pipeline(steps=[
+    ("preprocess", preprocess),
+    ("model", LogisticRegression(max_iter=1000, random_state=RANDOM_STATE))
+])
+
+param_lr = {
+    "model__C": [0.1, 1.0, 3.0],
+    "model__penalty": ["l2"]
+}
+
+cv = GroupKFold(n_splits=5)
+gs_lr = GridSearchCV(logreg, param_lr, scoring="average_precision",
+                     cv=cv.split(X_train, y_train_bin, groups=groups), n_jobs=-1)
+gs_lr.fit(X_train, y_train_bin)
+
+def eval_classifier(pipeline, X_te, y_te):
+    proba = pipeline.predict_proba(X_te)[:,1]
+    ap = average_precision_score(y_te, proba)
+    roc = roc_auc_score(y_te, proba)
+    # Recall@Top-20%
+    k = max(1, int(0.2 * len(y_te)))
+    order = np.argsort(-proba)[:k]
+    recall_at_20 = y_te.iloc[order].sum() / y_te.sum() if y_te.sum() > 0 else 0.0
+    return {"ap": float(ap), "roc_auc": float(roc), "recall_at_20": float(recall_at_20)}, proba
+
+lr_metrics, lr_proba = eval_classifier(gs_lr.best_estimator_, X_test, y_test_bin)
+print("Logistic Regression (test):", lr_metrics)
+
+xgb_cls_metrics = None
+
+xgb_cls = Pipeline(steps=[
+    ("preprocess", preprocess),
+    ("model", XGBClassifier(
+        random_state=RANDOM_STATE, n_estimators=150, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8, max_depth=4, reg_lambda=1.0,
+        eval_metric="logloss"
+    ))
+])
+xgb_cls.fit(X_train, y_train_bin)
+xgb_cls_metrics, xgb_proba = eval_classifier(xgb_cls, X_test, y_test_bin)
+print("XGBClassifier (test):", xgb_cls_metrics)
+
+#Selección de modelo y gráficas (PR/ROC, comparación vs baseline)
+
+def plot_pr(y_true, scores, title):
+    precision, recall, _ = precision_recall_curve(y_true, scores)
+    plt.figure()
+    plt.step(recall, precision, where='post')
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title(title)
+    plt.grid(True)
+    plt.show()
+
+def plot_roc(y_true, scores, title):
+    fpr, tpr, _ = roc_curve(y_true, scores)
+    plt.figure()
+    plt.plot(fpr, tpr)
+    plt.plot([0,1],[0,1], linestyle="--")
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    plt.title(title)
+    plt.grid(True)
+    plt.show()
+
+# PR/ROC para el mejor clasificador disponible (LogReg por defecto)
+plot_pr(y_test_bin, lr_proba, "Precision-Recall — Logistic Regression")
+plot_roc(y_test_bin, lr_proba, "ROC — Logistic Regression")
+
+# Tabla comparativa simple
+comp = {
+    "baseline_reg": base_reg_metrics,
+    "enet_reg": enet_metrics
+}
+if 'gbm_results' in globals():
+    for k,v in gbm_results.items():
+        comp[f"{k}_reg"] = v
+
+comp_cls = {
+    "baseline_cls": base_cls_metrics,
+    "logreg_cls": lr_metrics
+}
+if 'xgb_cls_metrics' in globals() and xgb_cls_metrics is not None:
+    comp_cls["xgb_cls"] = xgb_cls_metrics
+
+print("\nComparación Regresión:")
+print(json.dumps(comp, indent=2))
+print("\nComparación Clasificación:")
+print(json.dumps(comp_cls, indent=2))
