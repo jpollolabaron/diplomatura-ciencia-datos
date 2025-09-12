@@ -97,37 +97,32 @@ for c in num_cols:
 '''
 
 print("Post-imputación, nulos:")
-display(df.isna().mean().sort_values(ascending=False))
+print(df.isna().mean().sort_values(ascending=False))
 
+# ------------------------------------------------------------------
+# Crear TARGET_REG (LOS_days) ANTES de split y filtrar nulos de LOS
+# ------------------------------------------------------------------
 df[TARGET_REG] = (df[DATE_DIS] - df[DATE_ADM]).dt.days.astype(float)
-
-p_long = PERCENTIL_LONG_STAY
-thr = df[TARGET_REG].quantile(p_long)
-df[TARGET_BIN] = (df[TARGET_REG] > thr).astype(int)
-
-print("Estadísticos LOS:")
-display(df[TARGET_REG].describe())
-print("Umbral long-stay (percentil):", p_long, "→", thr)
-df[TARGET_BIN].value_counts(normalize=True)
+df = df.dropna(subset=[TARGET_REG]).copy()
 
 # Separa train/test sin fuga por paciente
+if df[GROUP_COL].isna().any():
+    df[GROUP_COL] = df[GROUP_COL].astype("string").fillna("missing_id")
+
 train_idx, test_idx = next(GroupKFold(n_splits=5).split(df, groups=df[GROUP_COL]))
+
 df_train = df.iloc[train_idx].copy()
 df_test  = df.iloc[test_idx].copy()
 
 print("Train:", df_train.shape, " Test:", df_test.shape)
-
-# Filtrar filas sin LOS calculado
-df_train = df_train.dropna(subset=[TARGET_REG]).copy()
-df_test = df_test.dropna(subset=[TARGET_REG]).copy()
 
 print("Train después del filtrado:", df_train.shape)
 print("Test después del filtrado:", df_test.shape)
 
 def subgroup_key(r):
   # Subgrupo simeple: tipo_admisión × bin_edad × ckd (Tolera NaN en age/admission_type/ckd)
-  # admission_type
-  adm = r.get("admission_type", "UNK")
+  # Campo de admisión tras normalizar: "type_of_admission_er_opd"
+  adm = r.get("type_of_admission_er_opd", r.get("admission_type", "UNK"))
   adm = "UNK" if pd.isna(adm) else str(adm)
 
   # age -> bin
@@ -227,6 +222,32 @@ def baseline_clasificacion(train, test):
     rec_at_20 = float(recall_at_topk(test[TARGET_BIN], y_score, k=k20))
     return {"ap": ap, "roc_auc": roc, "recall_at_20": rec_at_20}, y_score
 
+def _label_with_train_thresholds(r):
+    k = subgroup_key(r)
+    thr = float(thr_by_key.get(k, global_thr))
+    return int(r[TARGET_REG] > thr)
+
+# Definir TARGET_BIN consistente con el baseline: umbral por SUBGRUPO aprendido en TRAIN
+p_long = PERCENTIL_LONG_STAY
+keys_train_for_thr = df_train.apply(subgroup_key, axis=1)
+thr_by_key = (
+    pd.DataFrame({"key": keys_train_for_thr, "los": df_train[TARGET_REG]})
+      .groupby("key")["los"].quantile(p_long)
+)
+global_thr = float(df_train[TARGET_REG].quantile(p_long))
+
+df_train[TARGET_BIN] = df_train.apply(_label_with_train_thresholds, axis=1)
+df_test[TARGET_BIN]  = df_test.apply(_label_with_train_thresholds, axis=1)
+
+print("Post-imputación, nulos:")
+print(df.isna().mean().sort_values(ascending=False))
+
+print("Estadísticos LOS:")
+print(df[TARGET_REG].describe())
+
+print("Umbral long-stay (percentil global en TRAIN):", p_long, "→", global_thr)
+print("Prevalencia long_stay - train/test:", df_train[TARGET_BIN].mean(), "/", df_test[TARGET_BIN].mean())
+
 base_reg_metrics, _ = baseline_regresion(df_train, df_test)
 base_cls_metrics, _ = baseline_clasificacion(df_train, df_test)
 
@@ -234,8 +255,11 @@ print("Baseline (Reg):", base_reg_metrics)
 print("Baseline (Cls):", base_cls_metrics)
 
 # Selección simple de columnas
-num_features = [c for c in df.select_dtypes(include=[np.number]).columns if c not in [TARGET_REG, TARGET_BIN, GROUP_COL]]
-cat_features = [c for c in df.columns if df[c].dtype in("object", "string")  and c not in [TARGET_REG, TARGET_BIN, GROUP_COL]]
+num_features = [c for c in df.select_dtypes(include=[np.number]).columns
+                if c not in [TARGET_REG, TARGET_BIN, GROUP_COL]]
+
+cat_features = [c for c in df.select_dtypes(include=["object", "string"]).columns
+                if c not in [TARGET_REG, TARGET_BIN, GROUP_COL]]
 
 numeric_transformer = Pipeline(steps=[
     ("imputer", SimpleImputer(strategy="median")),
