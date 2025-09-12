@@ -44,6 +44,42 @@ from lightgbm import LGBMRegressor, LGBMClassifier
 
 # Ignorar advertencias para no ensuciar la salida en Colab
 warnings.filterwarnings("ignore")
+import kagglehub
+import chardet
+
+# Semilla para reproducibilidad
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+random.seed(RANDOM_STATE)
+
+# Parámetros específicos del problema
+PERCENTIL_LONG_STAY = 0.80  # percentil para definir "long_stay"
+
+# Nombres de columnas relevantes en el dataset
+GROUP_COL = "mrd_no"
+DATE_ADM = "d_o_a"
+DATE_DIS = "d_o_d"
+TARGET_REG = "LOS_days"
+TARGET_BIN = "long_stay"
+
+# Cargar el dataset desde Kaggle
+path = kagglehub.dataset_download("ashishsahani/hospital-admissions-data")
+file_path = os.path.join(path, "HDHI Admission data.csv")
+with open(file_path, "rb") as f:
+    raw_data = f.read(100000)
+    result = chardet.detect(raw_data)
+df = pd.read_csv(file_path, encoding=result["encoding"])
+
+# Inspección inicial del dataset
+print(df.shape)
+df.head()
+
+# ============================================================
+# CONFIGURACIÓN INICIAL DEL ENTORNO Y PARÁMETROS DEL MODELO
+# ============================================================
+
+# Ignorar advertencias para no ensuciar la salida en Colab
+warnings.filterwarnings("ignore")
 
 # Semilla para reproducibilidad
 RANDOM_STATE = 42
@@ -120,7 +156,8 @@ parsear_fechas(df, "d_o_d", dayfirst=True)
 # 3) Inspección del dataset tras normalización
 print(df.head())
 print("Nulos por columna:")
-print(df.isna().mean().sort_values(ascending=False))
+#print(df.isna().mean().sort_values(ascending=False))
+print(df.isnull().sum().sort_values(ascending = False)) #NACHO: me parece mejor asi ver los nulls, mas claro cuantas filas
 
 # 4) Eliminar casos en que la fecha de alta < fecha de ingreso
 mask_bad = df[DATE_DIS] < df[DATE_ADM]
@@ -128,6 +165,135 @@ print("Registros con alta < ingreso:", mask_bad.sum())
 df = df[~mask_bad].copy()
 
 print("Dataset limpio:", df.shape)
+
+# ============================================================
+# Duplicados
+# ============================================================
+
+# "MDR No." es el id del paciente, por lo que puede estar repetido porque puede enfermarse muchas veces, pero no deberia tener la misma fecha de admision (D.O.A), ese caso seria considerado un duplicado
+SNO = df[df.duplicated(subset=['mrd_no', 'd_o_a'], keep=False)]
+
+print("Cantidad de duplicados:", len(SNO))
+
+df = df.drop_duplicates(subset=['mrd_no', 'd_o_a'], keep='first')
+
+print("Dataset sin duplicados:", len(df))
+
+# ============================================================
+# EDA + Tratamiento inicial de datos
+# ============================================================
+
+# 1) Detección de outliers básicos (ejemplo con variables clínicas clave)
+# Usamos criterios médicos simplificados, ajustables según dominio
+OUTLIER_RULES = {
+    "hb":       {"min": 6, "max": 20},   # Hemoglobina
+    "creatinine": {"min": 0.2, "max": 5}, # Creatinina
+    "ef":       {"min": 10, "max": 80}   # Fracción de eyección
+}
+
+for col, rules in OUTLIER_RULES.items():
+    if col in df.columns:
+        # Convertir a numérico, todo lo que no sea número queda en NaN
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Flag de outlier (solo si no es nulo)
+        df[f"{col}_outlier"] = (
+            (df[col] < rules["min"]) | (df[col] > rules["max"])
+        ).fillna(0).astype(int)
+
+        # Winsorización simple
+        df[col] = df[col].clip(lower=rules["min"], upper=rules["max"])
+
+
+# 2) Imputación de nulos por subgrupo (ejemplo: emergencia vs ambulatorio)
+# Creamos flags de "faltante" y luego imputamos con la mediana por subgrupo
+SUBGROUP_COL = "type_of_admission_emergency_opd"
+
+for col in ["hb", "creatinine", "ef"]:
+    if col in df.columns:
+        # Flag de missing
+        df[f"{col}_missing"] = df[col].isna().astype(int)
+
+        if SUBGROUP_COL in df.columns:
+            df[col] = df.groupby(SUBGROUP_COL)[col]\
+                        .transform(lambda g: g.fillna(g.median()))
+        else:
+            df[col] = df[col].fillna(df[col].median())
+
+
+# 3) Normalización / estandarización preliminar (solo numéricas continuas)
+from sklearn.preprocessing import StandardScaler
+
+num_cols = ["hb", "creatinine", "glucose", "ef"]
+scaler = StandardScaler()
+
+for col in num_cols:
+    if col in df.columns:
+        # convertir a numérico: cualquier string no convertible → NaN
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # imputar provisoriamente con la mediana (para que no quede NaN en el scaler)
+        median_val = df[col].median()
+        df[col] = df[col].fillna(median_val)
+
+        # crear columna estandarizada
+        df[f"{col}_z"] = scaler.fit_transform(df[[col]])
+
+# 4) Quick check: proporción de nulos y outliers luego del preprocesado
+print("\nResumen de banderas:")
+for col in df.columns:
+    if col.endswith("_missing") or col.endswith("_outlier"):
+        print(f"{col}: {df[col].mean():.3f}")
+
+# ============================================================
+# Ingeniería de Variables
+# ============================================================
+
+# 1) Binning de edad
+if "age" in df.columns:
+    df["age_bin"] = pd.cut(
+        df["age"],
+        bins=[0, 40, 60, 80, 120],
+        labels=["<=40", "41-60", "61-80", ">80"]
+    )
+
+# 2) Binning de EF (Fracción de eyección)
+if "ef" in df.columns:
+    df["ef_bin"] = pd.cut(
+        df["ef"],
+        bins=[0, 30, 50, 80, 100],
+        labels=["Muy baja", "Moderada", "Conservada", "Alta"]
+    )
+
+# 3) Conteo de comorbilidades
+comorbs = ["dm", "htn", "ckd", "cad", "prior_cmp"]
+df["comorb_count"] = df[comorbs].sum(axis=1, skipna=True)
+
+# 4) Interacciones
+if "ckd" in df.columns and "creatinine" in df.columns:
+    df["ckd_x_creatinine"] = df["ckd"] * df["creatinine"]
+
+if "type_of_admission_emergency_opd" in df.columns and "age" in df.columns:
+    # Variable indicadora: admisión de emergencia y edad >60
+    df["er_x_age60"] = (
+        (df["type_of_admission_emergency_opd"] == "emergency").astype(int)
+        * (df["age"] > 60).astype(int)
+    )
+
+# 5) Features de calendario (a partir de fecha de ingreso)
+if DATE_ADM in df.columns:
+    df["adm_month"] = df[DATE_ADM].dt.month
+    df["adm_weekday"] = df[DATE_ADM].dt.weekday
+    df["adm_season"] = pd.cut(
+        df["adm_month"],
+        bins=[0, 3, 6, 9, 12],
+        labels=["Verano", "Otoño", "Invierno", "Primavera"]
+    )
+
+print("\nFeatures creadas:")
+print([c for c in df.columns if c in ["age_bin", "ef_bin", "comorb_count",
+                                      "ckd_x_creatinine", "er_x_age60",
+                                      "adm_month", "adm_weekday", "adm_season"]])
 
 # ============================================================
 # DEFINICIÓN DEL TARGET Y SPLIT TRAIN/TEST
