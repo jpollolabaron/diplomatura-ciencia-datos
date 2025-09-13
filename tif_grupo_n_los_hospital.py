@@ -349,8 +349,9 @@ def baseline_regresion(train, test):
     mae = mean_absolute_error(test[TARGET_REG], y_pred)
     mse = mean_squared_error(test[TARGET_REG], y_pred)
     rmse = float(np.sqrt(mse))
+    mape = mean_absolute_percentage_error(test[TARGET_REG], y_pred)
 
-    return {"mae": float(mae), "rmse": rmse}, y_pred
+    return {"mae": float(mae), "rmse": rmse, "mape": float(mape)}, y_pred
 
 # ------------------------------------------------------------
 # Baseline de clasificación
@@ -592,19 +593,21 @@ enet = Pipeline(steps=[
     ("model", ElasticNet(random_state=RANDOM_STATE, max_iter=10000))
 ])
 
-# Hiperparámetros: versión reducida para acelerar entrenamiento
+# Hiperparámetros:
+
+# versión reducida para acelerar entrenamiento
+'''
 param_enet = {
     "model__alpha": [0.1, 1.0],   # fuerza de regularización
     "model__l1_ratio": [0.5]      # mezcla L1/L2
 }
-
 '''
+
 # Versión más compleja (más lenta):
 param_enet = {
     "model__alpha": [0.01, 0.1, 1.0],
     "model__l1_ratio": [0.1, 0.5, 0.9]
 }
-'''
 
 gs_enet = GridSearchCV(enet, param_enet, scoring="neg_mean_absolute_error", cv=gkf.split(X_train, y_train_reg, groups=groups), n_jobs=-1)
 gs_enet.fit(X_train, y_train_reg)
@@ -613,13 +616,26 @@ gs_enet.fit(X_train, y_train_reg)
 # 3) Función de evaluación (para reusar en todos los modelos)
 # ------------------------------------------------------------
 
+def mean_absolute_percentage_error(y_true, y_pred):
+    """
+    Calcula el MAPE (Mean Absolute Percentage Error).
+    Ignora los casos donde y_true=0 para evitar divisiones por cero.
+    """
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    mask = y_true != 0
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+
+
 def eval_regressor(pipeline, X_te, y_te):
-    # Evalúa un regresor y devuelve métricas MAE y RMSE
+    """
+    Evalúa un regresor y devuelve métricas MAE, RMSE y MAPE.
+    """
     pred = pipeline.predict(X_te)
     mae = mean_absolute_error(y_te, pred)
     mse = mean_squared_error(y_te, pred)
     rmse = np.sqrt(mse)
-    return {"mae": float(mae), "rmse": float(rmse)}, pred
+    mape = mean_absolute_percentage_error(y_te, pred)
+    return {"mae": float(mae), "rmse": float(rmse), "mape": float(mape)}, pred
 
 enet_metrics, enet_pred = eval_regressor(gs_enet.best_estimator_, X_test, y_test_reg)
 print("ElasticNet (test):", enet_metrics)
@@ -678,25 +694,31 @@ all_metrics = {
     "LGBMRegressor": gbm_results["lgbm"]
 }
 
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
 # --- Panel 1: MAE ---
 mae_values = [m["mae"] for m in all_metrics.values()]
 axes[0].bar(all_metrics.keys(), mae_values, color=["gray", "skyblue", "orange", "green"])
-axes[0].set_title("Comparación MAE (Error Absoluto Medio)")
+axes[0].set_title("Comparación MAE")
 axes[0].set_ylabel("Días")
-axes[0].grid(axis="y", linestyle="--", alpha=0.7)
 for i, v in enumerate(mae_values):
     axes[0].text(i, v, f"{v:.2f}", ha="center", va="bottom")
 
 # --- Panel 2: RMSE ---
 rmse_values = [m["rmse"] for m in all_metrics.values()]
 axes[1].bar(all_metrics.keys(), rmse_values, color=["gray", "skyblue", "orange", "green"])
-axes[1].set_title("Comparación RMSE (Raíz Error Cuadrático Medio)")
+axes[1].set_title("Comparación RMSE")
 axes[1].set_ylabel("Días")
-axes[1].grid(axis="y", linestyle="--", alpha=0.7)
 for i, v in enumerate(rmse_values):
     axes[1].text(i, v, f"{v:.2f}", ha="center", va="bottom")
+
+# --- Panel 3: MAPE ---
+mape_values = [m["mape"] for m in all_metrics.values()]
+axes[2].bar(all_metrics.keys(), mape_values, color=["gray", "skyblue", "orange", "green"])
+axes[2].set_title("Comparación MAPE (%)")
+axes[2].set_ylabel("Porcentaje")
+for i, v in enumerate(mape_values):
+    axes[2].text(i, v, f"{v:.2f}%", ha="center", va="bottom")
 
 plt.suptitle("Métricas de Modelos de Regresión (con Baseline)", fontsize=14, fontweight="bold")
 plt.show()
