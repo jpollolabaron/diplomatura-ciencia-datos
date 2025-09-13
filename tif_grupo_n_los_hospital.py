@@ -21,6 +21,7 @@ import pandas as pd
 
 # VISUALIZACIÓN
 import matplotlib.pyplot as plt
+from IPython.display import display
 
 # ENTORNO KAGGLE
 import kagglehub
@@ -54,11 +55,11 @@ random.seed(RANDOM_STATE)
 PERCENTIL_LONG_STAY = 0.80  # percentil para definir "long_stay"
 
 # Nombres de columnas relevantes en el dataset
-GROUP_COL = "mrd_no"
-DATE_ADM = "d_o_a"
-DATE_DIS = "d_o_d"
-TARGET_REG = "LOS_days"
-TARGET_BIN = "long_stay"
+GROUP_COL = "mrd_no"      # Nro de registro del paciente
+DATE_ADM = "d_o_a"        # Fecha de ingreso
+DATE_DIS = "d_o_d"        # Fecha de alta
+TARGET_REG = "LOS_days"   # Variable continua a predecir: tiempo de estadía (en días)
+TARGET_BIN = "long_stay"  # Variable binaria a predecir: estancia prolongada (Sí/No)
 
 # Cargar el dataset desde Kaggle
 path = kagglehub.dataset_download("ashishsahani/hospital-admissions-data")
@@ -123,8 +124,7 @@ parsear_fechas(df, "d_o_d", dayfirst=True)
 # 3) Inspección del dataset tras normalización
 print(df.head())
 print("Nulos por columna:")
-#print(df.isna().mean().sort_values(ascending=False))
-print(df.isnull().sum().sort_values(ascending = False)) #NACHO: me parece mejor asi ver los nulls, mas claro cuantas filas
+print(df.isnull().sum().sort_values(ascending = False))
 
 # 4) Eliminar casos en que la fecha de alta < fecha de ingreso
 mask_bad = df[DATE_DIS] < df[DATE_ADM]
@@ -151,11 +151,11 @@ print("Dataset sin duplicados:", len(df))
 # ============================================================
 
 # 1) Detección de outliers básicos (ejemplo con variables clínicas clave)
-# Usamos criterios médicos simplificados, ajustables según dominio
+# Se usan criterios médicos simplificados, ajustables según dominio
 OUTLIER_RULES = {
-    "hb":       {"min": 6, "max": 20},   # Hemoglobina
-    "creatinine": {"min": 0.2, "max": 5}, # Creatinina
-    "ef":       {"min": 10, "max": 100}   # Fracción de eyección
+    "hb":       {"min": 6, "max": 20},      # Hemoglobina
+    "creatinine": {"min": 0.2, "max": 5},   # Creatinina
+    "ef":       {"min": 10, "max": 100}     # Fracción de eyección
 }
 
 for col, rules in OUTLIER_RULES.items():
@@ -168,7 +168,7 @@ for col, rules in OUTLIER_RULES.items():
             (df[col] < rules["min"]) | (df[col] > rules["max"])
         ).fillna(0).astype(int)
 
-        # Winsorización simple
+        # Recorte simple
         df[col] = df[col].clip(lower=rules["min"], upper=rules["max"])
 
 
@@ -206,7 +206,7 @@ for col in num_cols:
         # crear columna estandarizada
         df[f"{col}_z"] = scaler.fit_transform(df[[col]])
 
-# 4) Quick check: proporción de nulos y outliers luego del preprocesado
+# 4) Comprobación rápida: proporción de nulos y outliers luego del preprocesado
 print("\nResumen de banderas:")
 for col in df.columns:
     if col.endswith("_missing") or col.endswith("_outlier"):
@@ -216,7 +216,7 @@ for col in df.columns:
 # Ingeniería de Variables
 # ============================================================
 
-# 1) Binning de edad
+# 1) Rangos de edad
 if "age" in df.columns:
     df["age_bin"] = pd.cut(
         df["age"],
@@ -224,7 +224,7 @@ if "age" in df.columns:
         labels=["<=40", "41-60", "61-80", ">80"]
     )
 
-# 2) Binning de EF (Fracción de eyección)
+# 2) Segmentación de EF (Fracción de eyección)
 if "ef" in df.columns:
     df["ef_bin"] = pd.cut(
         df["ef"],
@@ -319,7 +319,7 @@ def generar_claves(df):
                       labels=["<=40", "41-60", "61-80", ">80"])
     age_labels = age_bins.astype(str).fillna("NA")   # NaN => "NA"
 
-    # ckd (CHRONIC KIDNEY DISEASE)
+    # ckd (chronic_kidney_disease)
     ckd_flag = df["ckd"].fillna(0).astype(int)      # flag binario CKD
 
     return pd.Series(list(zip(adm, age_labels, ckd_flag)), index=df.index)
@@ -327,6 +327,7 @@ def generar_claves(df):
 # ------------------------------------------------------------
 # Baseline de regresión
 # ------------------------------------------------------------
+
 def baseline_regresion(train, test):
     """
     Baseline de regresión:
@@ -439,7 +440,6 @@ preprocess = ColumnTransformer(
     ]
 )
 
-
 # ------------------------------------------------------------
 # 4) Inspección: lista de features seleccionadas
 # ------------------------------------------------------------
@@ -449,15 +449,28 @@ print("Cat features:", cat_features)
 
 # ============================================================
 # EVALUACIÓN 5-FOLD (GroupKFold) — BASELINES + MODELOS
+# ------------------------------------------------------------
+# Se evalúan baselines y modelos entrenando y testeando por fold,
+# respetando los grupos (GroupKFold) para evitar fuga entre train/test
+# cuando hay dependencia intra-grupo.
 # ============================================================
 
+# CV por grupos con 5 folds: ningún grupo aparece a la vez en train y test.
 gkf = GroupKFold(n_splits=5)
 
 # Acumuladores de métricas (baselines)
+
+# Baseline de REG mide error absoluto medio (MAE) y RMSE sobre LOS.
 bl_reg_mae, bl_reg_rmse = [], []
+
+# Baseline de CLS mide:
+#  - AP (average precision, área bajo PR),
+#  - ROC-AUC (área bajo ROC),
+#  - Recall@20% (recuperación tomando el top 20% por score).
 bl_cls_ap, bl_cls_auc, bl_cls_recall20 = [], [], []
 
 # Acumuladores de métricas (modelos)
+# Mismas métricas que en los baselines para comparación directa.
 mdl_reg_mae, mdl_reg_rmse = [], []
 mdl_cls_ap, mdl_cls_auc, mdl_cls_recall20 = [], [], []
 
@@ -466,6 +479,9 @@ for tr_idx, te_idx in gkf.split(df, groups=df[GROUP_COL]):
     te_df = df.iloc[te_idx].copy()
 
     # ---------- Etiquetado TARGET_BIN por fold (usando SOLO train del fold) ----------
+    # Se define el target binario en función del percentil PERCENTIL_LONG_STAY
+    # aprendido únicamente en el conjunto de entrenamiento del fold.
+    # OJO: esta definición debe hacerse por fold para evitar mirar información del test.
     keys_tr = generar_claves(tr_df)
     keys_te = generar_claves(te_df)
 
@@ -476,19 +492,18 @@ for tr_idx, te_idx in gkf.split(df, groups=df[GROUP_COL]):
     te_df[TARGET_BIN] = (te_df[TARGET_REG] > keys_te.map(thr_by_key).fillna(global_thr)).astype(int)
 
     # ---------- Baselines ----------
-    # Regresión
+    # REGRESIÓN: baseline_regresion devuelve métricas y predicción out-of-fold sobre TEST.
     reg_metrics, reg_pred = baseline_regresion(tr_df, te_df)
     bl_reg_mae.append(reg_metrics["mae"])
     bl_reg_rmse.append(reg_metrics["rmse"])
 
-    # Clasificación
+    # CLASIFICACIÓN: baseline_clasificacion devuelve métricas y scores de probabilidad para TEST.
     cls_metrics, cls_score = baseline_clasificacion(tr_df, te_df)
     bl_cls_ap.append(cls_metrics["ap"])
     bl_cls_auc.append(cls_metrics["roc_auc"])
     bl_cls_recall20.append(cls_metrics["recall_at_20"])
 
-    # ---------- Modelos (usando tu 'preprocess') ----------
-    # --- REGRESIÓN (ElasticNet como en tu ejemplo) ---
+    # --- REGRESIÓN (ElasticNet) ---
     X_tr_reg = tr_df.drop([TARGET_REG, TARGET_BIN], axis=1)
     y_tr_reg = tr_df[TARGET_REG]
     X_te_reg = te_df.drop([TARGET_REG, TARGET_BIN], axis=1)
@@ -503,7 +518,7 @@ for tr_idx, te_idx in gkf.split(df, groups=df[GROUP_COL]):
     mdl_reg_mae.append(mean_absolute_error(y_te_reg, y_pred_reg))
     mdl_reg_rmse.append(np.sqrt(mean_squared_error(y_te_reg, y_pred_reg)))
 
-    # --- CLASIFICACIÓN (LogisticRegression simple como ejemplo) ---
+    # --- CLASIFICACIÓN ---
     X_tr_cls = tr_df.drop([TARGET_REG, TARGET_BIN], axis=1)
     y_tr_cls = tr_df[TARGET_BIN].astype(int)
     X_te_cls = te_df.drop([TARGET_REG, TARGET_BIN], axis=1)
@@ -543,12 +558,12 @@ print("Cls — AP:", np.mean(mdl_cls_ap), "ROC-AUC:", np.mean(mdl_cls_auc), "Rec
 # 1) Separación de features (X) y target (y)
 # ------------------------------------------------------------
 
-# Split final (single fold) para comparativas de abajo
+# Hold-out final (un solo fold) para las comparativas siguientes
 tr_idx, te_idx = next(gkf.split(df, groups=df[GROUP_COL]))
 df_train = df.iloc[tr_idx].copy()
 df_test  = df.iloc[te_idx].copy()
 
-# Etiquetado TARGET_BIN con thresholds aprendidos en TRAIN
+# Etiquetado de TARGET_BIN con umbrales aprendidos en el conjunto de entrenamiento (TRAIN)
 keys_tr = generar_claves(df_train)
 keys_te = generar_claves(df_test)
 
@@ -558,10 +573,9 @@ global_thr = float(df_train[TARGET_REG].quantile(PERCENTIL_LONG_STAY))
 df_train[TARGET_BIN] = (df_train[TARGET_REG] > keys_tr.map(thr_by_key).fillna(global_thr)).astype(int)
 df_test[TARGET_BIN]  = (df_test[TARGET_REG]  > keys_te.map(thr_by_key).fillna(global_thr)).astype(int)
 
-# Baselines para las comparativas de más abajo
+# Baselines para las comparativas que siguen
 base_reg_metrics, _ = baseline_regresion(df_train, df_test)
 base_cls_metrics, base_cls_scores = baseline_clasificacion(df_train, df_test)
-
 
 X_train = df_train.drop([TARGET_REG, TARGET_BIN], axis=1)
 y_train_reg = df_train[TARGET_REG]
@@ -653,10 +667,10 @@ lgb_reg.fit(X_train, y_train_reg)
 gbm_results["lgbm"], lgbm_pred = eval_regressor(lgb_reg, X_test, y_test_reg)
 print("LGBMRegressor (test):", gbm_results["lgbm"])
 
+# --------------------------------------------------------------
+# Gráfico comparativo de modelos de regresión (incluye baseline)
+# --------------------------------------------------------------
 
-# ------------------------------------------------------------
-# Gráfico comparativo de modelos de regresión (con baseline)
-# ------------------------------------------------------------
 all_metrics = {
     "Baseline": base_reg_metrics,
     "ElasticNet": enet_metrics,
