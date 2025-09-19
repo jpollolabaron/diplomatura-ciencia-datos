@@ -29,7 +29,7 @@ import kagglehub
 # SCIKIT-LEARN: MODELADO Y PREPROCESAMIENTO
 from sklearn.model_selection import GroupKFold, GridSearchCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score, average_precision_score, precision_recall_curve, roc_curve
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import FunctionTransformer,StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import ElasticNet, LogisticRegression
@@ -98,16 +98,46 @@ def normalizar_cols(cols):
         out.append(c)
     return out
 
-def parsear_fechas(df, col, dayfirst=True):
-    """
-    Convierte la columna indicada de un DataFrame a tipo datetime.
-    - Si la columna existe, intenta parsear las fechas.
-    - Los errores se convierten a NaT (valor nulo de fechas).
-    - dayfirst=True asume formato europeo/latino (DD/MM/YYYY).
-    """
+def corregir_fechas(df):
+    # 1) Respaldos
+    df["d_o_a_raw"] = df["d_o_a"].astype(str)
+    df["d_o_d_raw"] = df["d_o_d"].astype(str)
 
-    if col in df.columns:
-        df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=dayfirst)
+    # 2) month_year -> datetime (Apr-17, Apr 2017, etc.)
+    mY = pd.to_datetime(df["month_year"], errors="coerce", format="%b-%y")
+    mY = mY.fillna(pd.to_datetime(df["month_year"], errors="coerce", infer_datetime_format=True))
+    bad_mY = mY.isna().sum()
+    if bad_mY:
+        print(f"[Diag] month_year no parseable en {bad_mY} filas")
+
+    # 3) D.O.A candidatos
+    doa_dfirst = pd.to_datetime(df["d_o_a_raw"], errors="coerce", dayfirst=True)
+    doa_mfirst = pd.to_datetime(df["d_o_a_raw"], errors="coerce", dayfirst=False)
+
+    match_dfirst = (doa_dfirst.dt.month == mY.dt.month) & (doa_dfirst.dt.year == mY.dt.year)
+    match_mfirst = (doa_mfirst.dt.month == mY.dt.month) & (doa_mfirst.dt.year == mY.dt.year)
+
+    doa_fixed = doa_dfirst.where(match_dfirst, doa_mfirst.where(match_mfirst, doa_dfirst))
+    df["d_o_a"] = doa_fixed
+
+    # 4) D.O.D candidatos
+    dod_dfirst = pd.to_datetime(df["d_o_d_raw"], errors="coerce", dayfirst=True)
+    dod_mfirst = pd.to_datetime(df["d_o_d_raw"], errors="coerce", dayfirst=False)
+
+    cand1_valid = dod_dfirst >= df["d_o_a"]
+    cand2_valid = dod_mfirst >= df["d_o_a"]
+
+    diff1 = (dod_dfirst - df["d_o_a"]).abs()
+    diff2 = (dod_mfirst - df["d_o_a"]).abs()
+    choose2 = cand2_valid & (~cand1_valid | (diff2 < diff1))
+
+    dod_fixed = dod_dfirst.mask(choose2, dod_mfirst)
+    dod_fixed = dod_fixed.fillna(dod_mfirst).fillna(dod_dfirst)
+    df["d_o_d"] = dod_fixed
+
+    # 5) Diagnóstico final
+    mask_bad = df["d_o_d"] < df["d_o_a"]
+    print("Registros con alta < ingreso (luego de corrección):", int(mask_bad.sum()))
     return df
 
 # ============================================================
@@ -118,8 +148,7 @@ def parsear_fechas(df, col, dayfirst=True):
 df.columns = normalizar_cols(df.columns)
 
 # 2) Parseo de fechas de admisión y alta
-parsear_fechas(df, "d_o_a", dayfirst=True)
-parsear_fechas(df, "d_o_d", dayfirst=True)
+df = corregir_fechas(df)
 
 # 3) Inspección del dataset tras normalización
 print(df.head())
@@ -216,21 +245,21 @@ for col in df.columns:
 # Ingeniería de Variables
 # ============================================================
 
+df["age"] = pd.to_numeric(df["age"], errors="coerce")
+
 # 1) Rangos de edad
-if "age" in df.columns:
-    df["age_bin"] = pd.cut(
-        df["age"],
-        bins=[0, 40, 60, 80, 120],
-        labels=["<=40", "41-60", "61-80", ">80"]
-    )
+df["age_bin"] = pd.cut(
+    df["age"],
+    bins=[0, 40, 60, 80, 120],
+    labels=["<=40", "41-60", "61-80", ">80"]
+)
 
 # 2) Segmentación de EF (Fracción de eyección)
-if "ef" in df.columns:
-    df["ef_bin"] = pd.cut(
-        df["ef"],
-        bins=[0, 30, 50, 80, 100],
-        labels=["Muy baja", "Moderada", "Conservada", "Alta"]
-    )
+df["ef_bin"] = pd.cut(
+    df["ef"],
+    bins=[0, 30, 50, 80, 100],
+    labels=["Muy baja", "Moderada", "Conservada", "Alta"]
+)
 
 # 3) Conteo de comorbilidades
 comorbs_all = ["dm", "htn", "ckd", "cad", "prior_cmp"]
@@ -238,25 +267,29 @@ comorbs = [c for c in comorbs_all if c in df.columns]
 df["comorb_count"] = df[comorbs].sum(axis=1, skipna=True)
 
 # 4) Interacciones
-if "ckd" in df.columns and "creatinine" in df.columns:
-    df["ckd_x_creatinine"] = df["ckd"] * df["creatinine"]
+df["ckd_x_creatinine"] = df["ckd"] * df["creatinine"]
 
-if "type_of_admission_emergency_opd" in df.columns and "age" in df.columns:
-    # Variable indicadora: admisión de emergencia y edad >60
-    df["er_x_age60"] = (
-        (df["type_of_admission_emergency_opd"] == "emergency").astype(int)
-        * (df["age"] > 60).astype(int)
-    )
+df["type_of_admission_emergency_opd"] = (
+      df["type_of_admission_emergency_opd"]
+      .astype(str).str.strip().str.upper()
+      .map({"E": "emergency", "O": "opd"})
+      .fillna("UNK")
+  )
+
+# Variable indicadora: admisión de emergencia y edad >60
+df["er_x_age60"] = (
+    (df["type_of_admission_emergency_opd"] == "emergency").astype(int)
+    * (df["age"] > 60).astype(int)
+)
 
 # 5) Features de calendario (a partir de fecha de ingreso)
-if DATE_ADM in df.columns:
-    df["adm_month"] = df[DATE_ADM].dt.month
-    df["adm_weekday"] = df[DATE_ADM].dt.weekday
-    df["adm_season"] = pd.cut(
-        df["adm_month"],
-        bins=[0, 3, 6, 9, 12],
-        labels=["Verano", "Otoño", "Invierno", "Primavera"]
-    )
+df["adm_month"] = df[DATE_ADM].dt.month
+df["adm_weekday"] = df[DATE_ADM].dt.weekday
+df["adm_season"] = pd.cut(
+    df["adm_month"],
+    bins=[0, 3, 6, 9, 12],
+    labels=["Verano", "Otoño", "Invierno", "Primavera"]
+)
 
 print("\nFeatures creadas:")
 print([c for c in df.columns if c in ["age_bin", "ef_bin", "comorb_count",
@@ -277,6 +310,13 @@ df = df.dropna(subset=[TARGET_REG]).copy()
 # Se fuerza a string y se completan nulos con un ID ficticio.
 if df[GROUP_COL].isna().any():
     df[GROUP_COL] = df[GROUP_COL].astype("string").fillna("missing_id")
+
+
+cols_to_show = [DATE_ADM, DATE_DIS, TARGET_REG, GROUP_COL]
+
+print(df[cols_to_show].head(10))
+
+df[['LOS_days', 'duration_of_stay']].head()
 
 # ============================================================
 # BASELINES: MÉTRICAS INICIALES PARA REGRESIÓN Y CLASIFICACIÓN
@@ -323,6 +363,33 @@ def generar_claves(df):
     ckd_flag = df["ckd"].fillna(0).astype(int)      # flag binario CKD
 
     return pd.Series(list(zip(adm, age_labels, ckd_flag)), index=df.index)
+
+
+# ------------------------------------------------------------
+# Función de evaluación (para reusar en todos los modelos)
+# ------------------------------------------------------------
+
+def mean_absolute_percentage_error(y_true, y_pred):
+    """
+    Calcula el MAPE (Mean Absolute Percentage Error).
+    Ignora los casos donde y_true=0 para evitar divisiones por cero.
+    """
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    mask = y_true != 0
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+
+
+def eval_regressor(pipeline, X_te, y_te):
+    """
+    Evalúa un regresor y devuelve métricas MAE, RMSE y MAPE.
+    """
+    pred = pipeline.predict(X_te)
+    mae = mean_absolute_error(y_te, pred)
+    mse = mean_squared_error(y_te, pred)
+    rmse = np.sqrt(mse)
+    mape = mean_absolute_percentage_error(y_te, pred)
+    return {"mae": float(mae), "rmse": float(rmse), "mape": float(mape)}, pred
+
 
 # ------------------------------------------------------------
 # Baseline de regresión
@@ -407,11 +474,17 @@ def baseline_clasificacion(train, test):
 #    - categóricas: object/string, excepto targets y grupo
 # ------------------------------------------------------------
 
-num_features = [c for c in df.select_dtypes(include=[np.number]).columns
-                if c not in [TARGET_REG, TARGET_BIN, GROUP_COL] and not c.endswith("_z")]
-
-cat_features = [c for c in df.select_dtypes(include=["object", "string", "category"]).columns
-                if c not in [TARGET_REG, TARGET_BIN, GROUP_COL]]
+num_features = [
+    'age','smoking','alcohol','dm','htn','cad','prior_cmp','ckd','hb','glucose','creatinine',
+    'ef','raised_cardiac_enzymes','severe_anaemia','anaemia','stable_angina',
+    'acs','stemi','atypical_chest_pain','heart_failure','hfref','hfnef','valvular','chb','sss','aki',
+    'cva_infract','cva_bleed','af','vt','psvt','congenital','uti','neuro_cardiogenic_syncope','orthostatic',
+    'infective_endocarditis','dvt','cardiogenic_shock','shock','pulmonary_embolism',
+    'comorb_count','ckd_x_creatinine','er_x_age60','tlc','platelets','urea','bnp'
+]
+cat_features = [
+    'gender','rural','type_of_admission_emergency_opd','age_bin','ef_bin','adm_weekday','adm_season'
+]
 
 # ------------------------------------------------------------
 # 2) Definición de transformadores
@@ -419,15 +492,33 @@ cat_features = [c for c in df.select_dtypes(include=["object", "string", "catego
 #    - Categóricas: imputación por moda + one-hot encoding
 # ------------------------------------------------------------
 
-numeric_transformer = Pipeline(steps=[
-    ("imputer", SimpleImputer(strategy="median")),
+TEXTOS_EN_NUMEROS = {"EMPTY", "", "NA", "N/A", "None", "null", "Null", "NULL", "-"}
+
+def to_numeric_matrix(X):
+    """
+    Recibe np.array (rama numérica), devuelve np.array numérico:
+    - Reemplaza textos por NaN
+    - Convierte a número con errors='coerce'
+    """
+    Xdf = pd.DataFrame(X)
+    # reemplaza textos en todo el bloque
+    Xdf = Xdf.replace(list(TEXTOS_EN_NUMEROS), np.nan)
+    # coerción a numérico columna por columna
+    for c in Xdf.columns:
+        Xdf[c] = pd.to_numeric(Xdf[c], errors="coerce")
+    return Xdf.values
+
+num_transformer = Pipeline(steps=[
+    ("to_numeric", FunctionTransformer(to_numeric_matrix, feature_names_out="one-to-one")),
+    ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
     ("scaler", StandardScaler())
 ])
 
-categorical_transformer = Pipeline(steps=[
+cat_transformer = Pipeline(steps=[
     ("imputer", SimpleImputer(strategy="most_frequent")),
-    ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ("ohe", OneHotEncoder(handle_unknown="ignore"))
 ])
+
 
 # ------------------------------------------------------------
 # 3) ColumnTransformer
@@ -436,17 +527,11 @@ categorical_transformer = Pipeline(steps=[
 
 preprocess = ColumnTransformer(
     transformers=[
-        ("num", numeric_transformer, num_features),
-        ("cat", categorical_transformer, cat_features)
-    ]
+        ("num", num_transformer, num_features),
+        ("cat", cat_transformer, cat_features),
+    ],
+    remainder="drop"
 )
-
-# ------------------------------------------------------------
-# 4) Inspección: lista de features seleccionadas
-# ------------------------------------------------------------
-
-print("Num features:", num_features)
-print("Cat features:", cat_features)
 
 # ============================================================
 # EVALUACIÓN 5-FOLD (GroupKFold) — BASELINES + MODELOS
@@ -546,6 +631,26 @@ print("\n=== Modelos (promedio 5-fold) ===")
 print("Reg — MAE:", np.mean(mdl_reg_mae), "RMSE:", np.mean(mdl_reg_rmse))
 print("Cls — AP:", np.mean(mdl_cls_ap), "ROC-AUC:", np.mean(mdl_cls_auc), "Recall@20%:", np.mean(mdl_cls_recall20))
 
+def bad_num_cols(df, num_cols):
+    bad = {}
+    for c in num_cols:
+        if c in df.columns:
+            s = df[c]
+            # dtypes objeto o mezclados
+            if s.dtype == "object":
+                bad[c] = s.value_counts(dropna=False).head(5).to_dict()
+            else:
+                # intenta convertir por si hay strings camuflados
+                sc = pd.to_numeric(s, errors="coerce")
+                if sc.isna().sum() > s.isna().sum():  # hubo strings no numéricos
+                    bad[c] = s[~s.astype(str).str.match(r"^-?\d+(\.\d+)?$", na=True)].head(5).tolist()
+    return bad
+
+bad = bad_num_cols(X_tr_reg, num_features)
+print("Columnas numéricas con strings:", bad)  # verás 'EMPTY', '', 'NA', etc.
+
+
+
 # ============================================================
 # MODELADO (SPLIT FINAL - HOLDOUT TEST): REGRESIÓN (LOS en días)
 # ============================================================
@@ -611,31 +716,6 @@ param_enet = {
 
 gs_enet = GridSearchCV(enet, param_enet, scoring="neg_mean_absolute_error", cv=gkf.split(X_train, y_train_reg, groups=groups), n_jobs=-1)
 gs_enet.fit(X_train, y_train_reg)
-
-# ------------------------------------------------------------
-# 3) Función de evaluación (para reusar en todos los modelos)
-# ------------------------------------------------------------
-
-def mean_absolute_percentage_error(y_true, y_pred):
-    """
-    Calcula el MAPE (Mean Absolute Percentage Error).
-    Ignora los casos donde y_true=0 para evitar divisiones por cero.
-    """
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    mask = y_true != 0
-    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
-
-
-def eval_regressor(pipeline, X_te, y_te):
-    """
-    Evalúa un regresor y devuelve métricas MAE, RMSE y MAPE.
-    """
-    pred = pipeline.predict(X_te)
-    mae = mean_absolute_error(y_te, pred)
-    mse = mean_squared_error(y_te, pred)
-    rmse = np.sqrt(mse)
-    mape = mean_absolute_percentage_error(y_te, pred)
-    return {"mae": float(mae), "rmse": float(rmse), "mape": float(mape)}, pred
 
 enet_metrics, enet_pred = eval_regressor(gs_enet.best_estimator_, X_test, y_test_reg)
 print("ElasticNet (test):", enet_metrics)
