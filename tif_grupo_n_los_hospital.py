@@ -86,7 +86,7 @@ def normalizar_cols(cols):
     - Colapsa múltiples "_" en uno solo.
     - Pasa todo a minúsculas.
     Ejemplo:
-        "D.O.A (Fecha Admisión)" -> "d_o_a_fecha_admision"
+        "D.O.A" -> "d_o_a"
     """
 
     out = []
@@ -99,45 +99,68 @@ def normalizar_cols(cols):
     return out
 
 def corregir_fechas(df):
-    # 1) Respaldos
-    df["d_o_a_raw"] = df["d_o_a"].astype(str)
-    df["d_o_d_raw"] = df["d_o_d"].astype(str)
+    # 1) Respaldos: guardamos copias en texto de las columnas originales
+    # para no perder la información antes de hacer conversiones.
+    df["d_o_a_raw"] = df[DATE_ADM].astype(str)
+    df["d_o_d_raw"] = df[DATE_DIS].astype(str)
 
-    # 2) month_year -> datetime (Apr-17, Apr 2017, etc.)
+    # 2) Normalización de la columna "month_year" (ej: "Apr-17", "Apr 2017")
+    # Primero intenta parsear con formato fijo "%b-%y".
     mY = pd.to_datetime(df["month_year"], errors="coerce", format="%b-%y")
+
+    # Para los que fallan, intenta de nuevo dejando que Pandas infiera el formato.
     mY = mY.fillna(pd.to_datetime(df["month_year"], errors="coerce", infer_datetime_format=True))
+
+    # Contamos cuántas filas quedaron sin parsear correctamente.
     bad_mY = mY.isna().sum()
     if bad_mY:
         print(f"[Diag] month_year no parseable en {bad_mY} filas")
 
-    # 3) D.O.A candidatos
+    # 3) Corrección de fechas de admisión (D.O.A)
+    # Generamos dos interpretaciones posibles de la fecha:
+    #   doa_dfirst - dayfirst=True (formato D/M/Y)
+    #   doa_mfirst - dayfirst=False (formato M/D/Y)
     doa_dfirst = pd.to_datetime(df["d_o_a_raw"], errors="coerce", dayfirst=True)
     doa_mfirst = pd.to_datetime(df["d_o_a_raw"], errors="coerce", dayfirst=False)
 
+    # Comprobamos cuál coincide en mes y año con "month_year".
     match_dfirst = (doa_dfirst.dt.month == mY.dt.month) & (doa_dfirst.dt.year == mY.dt.year)
     match_mfirst = (doa_mfirst.dt.month == mY.dt.month) & (doa_mfirst.dt.year == mY.dt.year)
 
+    # Seleccionamos:
+    # - Si dayfirst coincide -> usamos esa fecha.
+    # - Si no, pero monthfirst coincide -> usamos esa.
+    # - En cualquier otro caso -> usamos la interpretación dayfirst por defecto.
     doa_fixed = doa_dfirst.where(match_dfirst, doa_mfirst.where(match_mfirst, doa_dfirst))
     df["d_o_a"] = doa_fixed
 
-    # 4) D.O.D candidatos
+    # 4) Corrección de fechas de alta (D.O.D)
+    # Igual que antes, generamos dos interpretaciones (dayfirst y monthfirst).
     dod_dfirst = pd.to_datetime(df["d_o_d_raw"], errors="coerce", dayfirst=True)
     dod_mfirst = pd.to_datetime(df["d_o_d_raw"], errors="coerce", dayfirst=False)
 
-    cand1_valid = dod_dfirst >= df["d_o_a"]
-    cand2_valid = dod_mfirst >= df["d_o_a"]
+    # Validamos que la fecha de alta sea >= fecha de ingreso.
+    cand1_valid = dod_dfirst >= df[DATE_ADM]
+    cand2_valid = dod_mfirst >= df[DATE_ADM]
 
-    diff1 = (dod_dfirst - df["d_o_a"]).abs()
-    diff2 = (dod_mfirst - df["d_o_a"]).abs()
+    # Calculamos la diferencia absoluta de días con respecto a la fecha de ingreso.
+    # Esto ayuda a elegir la fecha más lógica si ambas son válidas.
+    diff1 = (dod_dfirst - df[DATE_ADM]).abs()
+    diff2 = (dod_mfirst - df[DATE_ADM]).abs()
+
+    # Regla de elección:
+    # - Usamos monthfirst si es válido y:
+    #   a) dayfirst no es válido, o
+    #   b) la diferencia con la fecha de ingreso es menor.
     choose2 = cand2_valid & (~cand1_valid | (diff2 < diff1))
 
+    # Construimos la fecha final de alta:
+    # - Si corresponde elegir monthfirst -> la usamos.
+    # - Si hay nulos, completamos primero con monthfirst y luego con dayfirst.
     dod_fixed = dod_dfirst.mask(choose2, dod_mfirst)
     dod_fixed = dod_fixed.fillna(dod_mfirst).fillna(dod_dfirst)
-    df["d_o_d"] = dod_fixed
+    df[DATE_DIS] = dod_fixed
 
-    # 5) Diagnóstico final
-    mask_bad = df["d_o_d"] < df["d_o_a"]
-    print("Registros con alta < ingreso (luego de corrección):", int(mask_bad.sum()))
     return df
 
 # ============================================================
@@ -147,13 +170,14 @@ def corregir_fechas(df):
 # 1) Normalización de nombres de columnas
 df.columns = normalizar_cols(df.columns)
 
-# 2) Parseo de fechas de admisión y alta
-df = corregir_fechas(df)
-
-# 3) Inspección del dataset tras normalización
+# 2) Inspección del dataset tras normalización
+print("Inspección del dataset:")
 print(df.head())
 print("Nulos por columna:")
 print(df.isnull().sum().sort_values(ascending = False))
+
+# 3) Parseo de fechas de admisión y alta
+df = corregir_fechas(df)
 
 # 4) Eliminar casos en que la fecha de alta < fecha de ingreso
 mask_bad = df[DATE_DIS] < df[DATE_ADM]
@@ -166,12 +190,12 @@ print("Dataset limpio:", df.shape)
 # Duplicados
 # ============================================================
 
-# "MDR No." es el id del paciente, por lo que puede estar repetido porque puede enfermarse muchas veces, pero no deberia tener la misma fecha de admision (D.O.A), ese caso seria considerado un duplicado
-SNO = df[df.duplicated(subset=['mrd_no', 'd_o_a'], keep=False)]
+# GROUP_COL ("MDR No.") es el id del paciente, por lo que puede estar repetido porque puede enfermarse muchas veces, pero no deberia tener la misma fecha de admision (D.O.A), ese caso seria considerado un duplicado
+SNO = df[df.duplicated(subset=[GROUP_COL, DATE_ADM], keep=False)]
 
 print("Cantidad de duplicados:", len(SNO))
 
-df = df.drop_duplicates(subset=['mrd_no', 'd_o_a'], keep='first')
+df = df.drop_duplicates(subset=[GROUP_COL, DATE_ADM], keep='first')
 
 print("Dataset sin duplicados:", len(df))
 
@@ -199,7 +223,6 @@ for col, rules in OUTLIER_RULES.items():
 
         # Recorte simple
         df[col] = df[col].clip(lower=rules["min"], upper=rules["max"])
-
 
 # 2) Imputación de nulos por subgrupo (ejemplo: emergencia vs ambulatorio)
 # Creamos flags de "faltante" y luego imputamos con la mediana por subgrupo
@@ -262,33 +285,26 @@ df["ef_bin"] = pd.cut(
 )
 
 # 3) Conteo de comorbilidades
-comorbs_all = ["dm", "htn", "ckd", "cad", "prior_cmp"]
-comorbs = [c for c in comorbs_all if c in df.columns]
+comorbs = ["dm", "htn", "ckd", "cad", "prior_cmp"]
 df["comorb_count"] = df[comorbs].sum(axis=1, skipna=True)
 
 # 4) Interacciones
 df["ckd_x_creatinine"] = df["ckd"] * df["creatinine"]
 
-df["type_of_admission_emergency_opd"] = (
-      df["type_of_admission_emergency_opd"]
-      .astype(str).str.strip().str.upper()
-      .map({"E": "emergency", "O": "opd"})
-      .fillna("UNK")
-  )
-
 # Variable indicadora: admisión de emergencia y edad >60
 df["er_x_age60"] = (
-    (df["type_of_admission_emergency_opd"] == "emergency").astype(int)
+    (df["type_of_admission_emergency_opd"] == "E").astype(int)
     * (df["age"] > 60).astype(int)
 )
 
 # 5) Features de calendario (a partir de fecha de ingreso)
 df["adm_month"] = df[DATE_ADM].dt.month
 df["adm_weekday"] = df[DATE_ADM].dt.weekday
+# estaciones en hemisferio norte
 df["adm_season"] = pd.cut(
     df["adm_month"],
     bins=[0, 3, 6, 9, 12],
-    labels=["Verano", "Otoño", "Invierno", "Primavera"]
+    labels=["Invierno", "Primavera", "Verano", "Otoño"]
 )
 
 print("\nFeatures creadas:")
@@ -311,10 +327,7 @@ df = df.dropna(subset=[TARGET_REG]).copy()
 if df[GROUP_COL].isna().any():
     df[GROUP_COL] = df[GROUP_COL].astype("string").fillna("missing_id")
 
-
-cols_to_show = [DATE_ADM, DATE_DIS, TARGET_REG, GROUP_COL]
-
-print(df[cols_to_show].head(10))
+print(df[[DATE_ADM, DATE_DIS, TARGET_REG, GROUP_COL]].head(10))
 
 df[['LOS_days', 'duration_of_stay']].head()
 
